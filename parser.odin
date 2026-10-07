@@ -15,27 +15,26 @@ Parser :: struct {
 
 Parse_Error :: enum {
 	None = 0, // zero value, so `err != nil` and `or_return` work
-	Not_A_Todo, // no "- [ ]" mark; caller skips the line
+	Not_A_Todo, 
 	Bad_Mark,
 	Bad_Date,
 	Bad_Priority,
 	Empty_Description,
 }
 
-// Drop a leading run of spaces/tabs.
+// Drop a leading run of spaces
 p_skip_space :: proc(p: ^Parser) {
 	p.rest = strings.trim_left_space(p.rest)
 }
 
-// If `rest` starts with `prefix`, consume it and report true. Otherwise the
-// parser is left untouched - this is the "try to match" primitive.
+
 p_eat :: proc(p: ^Parser, prefix: string) -> bool {
 	if !strings.has_prefix(p.rest, prefix) do return false
 	p.rest = p.rest[len(prefix):]
 	return true
 }
 
-// Next whitespace-delimited word, consumed. "" when the input is exhausted.
+// "" when empty
 p_next_word :: proc(p: ^Parser) -> string {
 	p_skip_space(p)
 	if p.rest == "" do return ""
@@ -50,8 +49,7 @@ p_next_word :: proc(p: ^Parser) -> string {
 	return w
 }
 
-// Look at the next word without committing to it: copy the cursor, advance the
-// copy, throw it away. This is how you get lookahead without a pushback buffer.
+
 p_peek_word :: proc(p: ^Parser) -> string {
 	q := p^
 	return p_next_word(&q)
@@ -78,11 +76,8 @@ parse_date :: proc(s: string) -> (t: time.Time, err: Parse_Error) {
 }
 
 
-//   - [ ] (A) 2026-09-16 2026-09-17 walk the dog +home @errands due:2026-09-18
+//   - [x] (A) 2026-09-16 2026-09-17 walk the dog +home @errands due:2026-09-18
 //   ^^^^^ ^^^ ^^^^^^^^^^ ^^^^^^^^^^ ^^^^^^^^^^^^ ^^^^^ ^^^^^^^^ ^^^^^^^^^^^^^
-//   mark  prio completion created   description  proj  context  due
-//
-// Only the mark + description are mandatory.
 parse_todo :: proc(s: string, allocator := context.allocator) -> (item: TodoItem, ok: bool) {
 	p := Parser{strings.trim_space(s)}
 
@@ -103,7 +98,7 @@ parse_todo :: proc(s: string, allocator := context.allocator) -> (item: TodoItem
 	if !p_eat(&p, "]") do return {}, false
 
 
-	// 2. priority "(A)" - optional, so peek before committing.
+	//priority "(A)" 
 	w := p_peek_word(&p)
 	if len(w) == 3 && w[0] == '(' && w[2] == ')' {
 		if prio, pok := priority_from_rune(rune(w[1])); pok {
@@ -112,23 +107,25 @@ parse_todo :: proc(s: string, allocator := context.allocator) -> (item: TodoItem
 	        }
 		}
 
-	// 3. dates
+	//dates
 	{
 		q := p
-		completion, c_err := parse_date(p_next_word(&q))
-		created, cr_err := parse_date(p_next_word(&q))
-		if c_err == nil && cr_err == nil {
-			dates: type_of(item.dates.?)
-			dates.completion = completion
-			dates.created = created
-			item.dates = dates
-			p = q
+		if first, err := parse_date(p_next_word(&q)); err == nil {
+			r := q
+			second, err2 := parse_date(p_next_word(&r))
+			if item.completed && err2 == nil {
+				item.completion = first
+				item.created = second
+				p = r
+			} else {
+				item.created = first
+				p = q
+			}
 		}
 	}
 
 
-	// 4. description + tags.
-	//    +proj / @ctx are legal anywhere and stay in the description text;
+	//description + tags.
 	p_skip_space(&p)
 	start := p.rest
 	desc_end := len(start)
