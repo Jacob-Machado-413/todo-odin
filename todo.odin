@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 import "core:time"
 import "core:time/timezone"
@@ -76,6 +77,10 @@ main :: proc() {
 		cmd_add(others)
 	case .Config:
 		cmd_config(others)
+	case .Done:
+		cmd_done(others)
+	case .Remove:
+		cmd_rm(others)
 	}
 
 
@@ -294,13 +299,28 @@ local_today :: proc() -> time.Time {
 // All todo lines in `data`, in file order. Lines that aren't todos (headings,
 // notes added in obsidian) are skipped, so a todo's index is its position in
 // this list, not its line number. Items slice into `data`; keep it alive.
-parse_todos :: proc(data: string) -> [dynamic]TodoItem {
-	items := make([dynamic]TodoItem)
-	src := data
-	for line in strings.split_lines_iterator(&src) {
-		if item, ok := parse_todo(line); ok do append(&items, item)
+parse_todos :: proc(data: string) -> [dynamic]Todo_Line {
+	todos := make([dynamic]Todo_Line)
+	start := 0
+	for start < len(data) {
+		nl := strings.index_byte(data[start:], '\n')
+		next := nl < 0 ? len(data) : start + nl + 1
+		end := nl < 0 ? len(data) : start + nl
+		if end > start && data[end - 1] == '\r' do end -= 1
+
+		if item, ok := parse_todo(data[start:end]); ok {
+			append(&todos, Todo_Line{item, start, end, next})
+		}
+		start = next
 	}
-	return items
+	return todos
+}
+
+// A parsed todo plus where it sits in the file: data[start:end] is the line
+// without its line ending, data[next:] is everything after it.
+Todo_Line :: struct {
+	item:              TodoItem,
+	start, end, next: int,
 }
 
 // `todo list` -> every todo, numbered from 1
@@ -312,22 +332,109 @@ cmd_list :: proc(args: []string) {
 		fmt.eprintfln("could not read %s: %v", path, err)
 		os.exit(1)
 	}
-	items := parse_todos(string(data)) // missing file -> no todos
+	todos := parse_todos(string(data)) // missing file -> no todos
 
 	if load_config().json {
-		rows := make([]Todo_Json, len(items))
-		for item, i in items do rows[i] = todo_to_json(item, i + 1)
+		rows := make([]Todo_Json, len(todos))
+		for t, i in todos do rows[i] = todo_to_json(t.item, i + 1)
 		print_json(rows)
 		return
 	}
 
+	for t, i in todos do print_todo(t.item, i + 1)
+}
+
+// One todo as a line of `list` text output.
+print_todo :: proc(item: TodoItem, index: int) {
 	buf: [len("2026-09-17")]u8
-	for item, i in items {
-		fmt.printf("% 3d [%c] ", i + 1, item.completed ? 'x' : ' ') // "% 3d": plain %3d zero-pads
-		if p, ok := item.priority.?; ok do fmt.printf("(%c) ", 'A' + rune(p))
-		fmt.print(item.description)
-		if d, ok := item.due_date.?; ok do fmt.printf("  due %s", time.to_string_yyyy_mm_dd(d, buf[:]))
-		fmt.println()
+	fmt.printf("% 3d [%c] ", index, item.completed ? 'x' : ' ') // "% 3d": plain %3d zero-pads
+	if p, ok := item.priority.?; ok do fmt.printf("(%c) ", 'A' + rune(p))
+	fmt.print(item.description)
+	if d, ok := item.due_date.?; ok do fmt.printf("  due %s", time.to_string_yyyy_mm_dd(d, buf[:]))
+	fmt.println()
+}
+
+// `todo done 1 3` -> mark todos 1 and 3 completed, stamped with today's date
+// `todo rm 2`     -> delete todo 2
+// Indexes are the ones `list` prints. All are checked before anything is
+// written; non-todo lines and untouched todos are kept byte-for-byte.
+cmd_done :: proc(args: []string) {edit_todos(args, remove = false)}
+cmd_rm :: proc(args: []string) {edit_todos(args, remove = true)}
+
+edit_todos :: proc(args: []string, remove: bool) {
+	usage := remove ? "usage: todo rm <index>..." : "usage: todo done <index>..."
+	if len(args) == 0 {
+		fmt.eprintln(usage)
+		os.exit(1)
+	}
+
+	path := get_todo_path()
+	raw, err := os.read_entire_file(path, context.allocator)
+	if err != nil && err != .Not_Exist {
+		fmt.eprintfln("could not read %s: %v", path, err)
+		os.exit(1)
+	}
+	data := string(raw)
+	todos := parse_todos(data)
+
+	selected := make([]bool, len(todos))
+	for arg in args {
+		n, ok := strconv.parse_int(arg)
+		if !ok {
+			fmt.eprintln(usage)
+			os.exit(1)
+		}
+		if n < 1 || n > len(todos) {
+			fmt.eprintfln("no todo %d (there are %d)", n, len(todos))
+			os.exit(1)
+		}
+		selected[n - 1] = true
+	}
+
+	today := local_today()
+	changed := make([dynamic]Todo_Json)
+	sb := strings.builder_make()
+	cursor := 0
+	for &t, i in todos {
+		if !selected[i] do continue
+		strings.write_string(&sb, data[cursor:t.start])
+
+		if remove {
+			cursor = t.next
+		} else {
+			if !t.item.completed {
+				t.item.completed = true
+				// completion is only written alongside a created date, see
+				// todo_to_string; without one the todo is just checked off
+				if t.item.created != nil do t.item.completion = today
+			}
+			strings.write_string(&sb, todo_to_string(t.item))
+			cursor = t.end
+		}
+		append(&changed, todo_to_json(t.item, i + 1))
+	}
+	strings.write_string(&sb, data[cursor:])
+
+	// write to a temp file and rename over the original, so a crash
+	// mid-write can't leave a half-written todo file
+	tmp := strings.concatenate({path, ".tmp"})
+	if werr := os.write_entire_file(tmp, strings.to_string(sb)); werr != nil {
+		fmt.eprintfln("could not write %s: %v", tmp, werr)
+		os.exit(1)
+	}
+	if rerr := os.rename(tmp, path); rerr != nil {
+		fmt.eprintfln("could not replace %s: %v", path, rerr)
+		os.exit(1)
+	}
+
+	if load_config().json {
+		print_json(changed[:])
+		return
+	}
+	for t, i in todos {
+		if !selected[i] do continue
+		fmt.print(remove ? "removed " : "done    ")
+		print_todo(t.item, i + 1)
 	}
 }
 
